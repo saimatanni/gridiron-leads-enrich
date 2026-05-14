@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv/
+.python-version
+
+# Streamlit
+.streamlit/
+
+# Project — never check in real lead data
+source.xlsx
+data/
+output/
+datasets/
+_tmp_upload/
+logs/
+status.json
+*.tmp
+.tmp/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
