@@ -22,13 +22,17 @@ import smtplib
 import socket
 import string
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
 
 import dns.exception
 import dns.resolver
 from ddgs import DDGS
+
+WORKERS = int(os.environ.get("GRIDIRON_DOMAIN_RECOVERY_WORKERS", "6"))
 
 ROOT = Path(os.environ.get("GRIDIRON_DATASET_ROOT") or Path(__file__).resolve().parent.parent)
 LEADS = ROOT / "data" / "leads_clean.csv"
@@ -243,120 +247,135 @@ def load_done() -> set[str]:
         return {r["lead_id"] for r in csv.DictReader(f)}
 
 
+def recover_one(lead: dict) -> dict:
+    """Try to recover an alternative valid email for a single dead-domain lead.
+    Pure function (no shared state) — safe to call in parallel."""
+    school = lead.get("school_name", "")
+    state = lead.get("state", "")
+    first = (lead.get("first_name") or "").lower()
+    last = (lead.get("last_name") or "").lower()
+    orig_email = lead.get("email", "").lower()
+    orig_domain = orig_email.split("@", 1)[-1] if "@" in orig_email else ""
+
+    result = {
+        "lead_id": lead["lead_id"],
+        "original_email": orig_email,
+        "original_domain": orig_domain,
+        "new_domain": "",
+        "new_email": "",
+        "new_status": "",
+        "smtp_message": "",
+        "source_url": "",
+    }
+
+    q = f'"{school}" "{state}"' if state else f'"{school}"'
+    results = search(q)
+    cands = candidate_domains(results, school, city=lead.get("city", ""))
+
+    tested = []
+    found = False
+    expanded: list[tuple[str, str]] = []
+    seen_dom = set()
+    for d, u in cands[:6]:
+        if d not in seen_dom:
+            expanded.append((d, u))
+            seen_dom.add(d)
+        parts = d.split(".")
+        if len(parts) >= 3:
+            if parts[-2] == "k12" and parts[-1] in ("us", "ca"):
+                root = ".".join(parts[-4:])
+            elif parts[-1] in ("us", "ca", "uk") and len(parts) >= 4:
+                root = ".".join(parts[-3:])
+            else:
+                root = ".".join(parts[-2:])
+            if root != d and root not in seen_dom:
+                expanded.append((root, u))
+                seen_dom.add(root)
+
+    email_patterns = [
+        lambda f, l: f"{f}.{l}",
+        lambda f, l: f"{f[0]}{l}" if f else l,
+        lambda f, l: f"{l}",
+        lambda f, l: f"{f}{l}",
+    ]
+
+    for new_domain, source_url in expanded:
+        if new_domain == orig_domain:
+            continue
+        if not lookup_mx(new_domain):
+            tested.append(f"{new_domain}=no_mx")
+            continue
+        best_status_here = ""
+        best_email_here = ""
+        best_msg_here = ""
+        for pat in email_patterns:
+            new_email = f"{pat(first, last)}@{new_domain}"
+            status, _code, msg = smtp_probe(new_email)
+            tested.append(f"{new_email}={status}")
+            if status == "valid":
+                best_status_here, best_email_here, best_msg_here = status, new_email, msg
+                break
+            if status == "catch_all" and not best_status_here:
+                best_status_here, best_email_here, best_msg_here = status, new_email, msg
+            if status == "unknown" and not best_status_here:
+                best_status_here, best_email_here, best_msg_here = status, new_email, msg
+        if best_status_here in ("valid", "catch_all", "unknown"):
+            result.update({
+                "new_domain": new_domain,
+                "new_email": best_email_here,
+                "new_status": best_status_here,
+                "smtp_message": best_msg_here,
+                "source_url": source_url,
+            })
+            found = True
+            break
+
+    if not found:
+        result["smtp_message"] = "; ".join(tested[:8]) if tested else "no candidates"
+    return result
+
+
 def main() -> None:
     dead = load_dead_leads()
     done = load_done()
     todo = [l for l in dead if l["lead_id"] not in done]
-    print(f"dead-domain leads: {len(dead)} | already done: {len(done)} | todo: {len(todo)}")
+    print(f"dead-domain leads: {len(dead)} | already done: {len(done)} | todo: {len(todo)} | workers: {WORKERS}")
     print()
 
     recovered = 0
     catch_all = 0
     is_new = not OUT.exists()
+    lock = threading.Lock()
+    completed = 0
+
     with OUT.open("a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=OUT_FIELDS)
         if is_new:
             w.writeheader()
-        for i, lead in enumerate(todo, 1):
-            school = lead.get("school_name", "")
-            state = lead.get("state", "")
-            first = (lead.get("first_name") or "").lower()
-            last = (lead.get("last_name") or "").lower()
-            orig_email = lead.get("email", "").lower()
-            orig_domain = orig_email.split("@", 1)[-1] if "@" in orig_email else ""
-
-            result = {
-                "lead_id": lead["lead_id"],
-                "original_email": orig_email,
-                "original_domain": orig_domain,
-                "new_domain": "",
-                "new_email": "",
-                "new_status": "",
-                "smtp_message": "",
-                "source_url": "",
-            }
-
-            # Step 1: find candidate domains
-            q = f'"{school}" "{state}"' if state else f'"{school}"'
-            results = search(q)
-            cands = candidate_domains(results, school, city=lead.get("city", ""))
-
-            tested = []
-            found = False
-
-            # Build expanded candidate list:
-            #   for each found domain, also try the root domain (strip subdomain)
-            expanded: list[tuple[str, str]] = []
-            seen_dom = set()
-            for d, u in cands[:6]:
-                if d not in seen_dom:
-                    expanded.append((d, u))
-                    seen_dom.add(d)
-                # If it's a subdomain, also try the registered root
-                parts = d.split(".")
-                if len(parts) >= 3:
-                    # Heuristic root: last 2 labels for generic TLDs, last 3 for k12.xx.us
-                    if parts[-2] == "k12" and parts[-1] in ("us", "ca"):
-                        root = ".".join(parts[-4:])
-                    elif parts[-1] in ("us", "ca", "uk") and len(parts) >= 4:
-                        root = ".".join(parts[-3:])
-                    else:
-                        root = ".".join(parts[-2:])
-                    if root != d and root not in seen_dom:
-                        expanded.append((root, u))
-                        seen_dom.add(root)
-
-            # Email patterns to try, in order of common school usage
-            email_patterns = [
-                lambda f, l: f"{f}.{l}",
-                lambda f, l: f"{f[0]}{l}" if f else l,
-                lambda f, l: f"{l}",
-                lambda f, l: f"{f}{l}",
-            ]
-
-            for new_domain, source_url in expanded:
-                if new_domain == orig_domain:
-                    continue
-                if not lookup_mx(new_domain):
-                    tested.append(f"{new_domain}=no_mx")
-                    continue
-                # Try each email pattern on this domain
-                best_status_here = ""
-                best_email_here = ""
-                best_msg_here = ""
-                for pat in email_patterns:
-                    new_email = f"{pat(first, last)}@{new_domain}"
-                    status, _code, msg = smtp_probe(new_email)
-                    tested.append(f"{new_email}={status}")
-                    if status == "valid":
-                        best_status_here, best_email_here, best_msg_here = status, new_email, msg
-                        break
-                    if status == "catch_all" and not best_status_here:
-                        best_status_here, best_email_here, best_msg_here = status, new_email, msg
-                    if status == "unknown" and not best_status_here:
-                        best_status_here, best_email_here, best_msg_here = status, new_email, msg
-                if best_status_here in ("valid", "catch_all", "unknown"):
-                    result.update({
-                        "new_domain": new_domain,
-                        "new_email": best_email_here,
-                        "new_status": best_status_here,
-                        "smtp_message": best_msg_here,
-                        "source_url": source_url,
-                    })
-                    found = True
-                    if best_status_here == "valid": recovered += 1
-                    elif best_status_here == "catch_all": catch_all += 1
-                    break
-
-            if not found:
-                result["smtp_message"] = "; ".join(tested[:8]) if tested else "no candidates"
-
-            w.writerow(result)
-            f.flush()
-            status_tag = result["new_status"] or "miss"
-            new_email_short = result["new_email"][:50] if result["new_email"] else "-"
-            print(f"[{i:3d}/{len(todo)}] {first:>10s}.{last:<12s} @ {school[:30]:30s} -> {status_tag:10s} {new_email_short}", flush=True)
-            time.sleep(random.uniform(0.8, 1.3))
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futures = {ex.submit(recover_one, l): l for l in todo}
+            for fut in as_completed(futures):
+                lead = futures[fut]
+                try:
+                    result = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    result = {
+                        "lead_id": lead["lead_id"], "original_email": lead.get("email",""),
+                        "original_domain":"", "new_domain":"", "new_email":"", "new_status":"",
+                        "smtp_message": f"err:{e.__class__.__name__}", "source_url":"",
+                    }
+                with lock:
+                    completed += 1
+                    w.writerow(result)
+                    f.flush()
+                    if result["new_status"] == "valid": recovered += 1
+                    elif result["new_status"] == "catch_all": catch_all += 1
+                    status_tag = result["new_status"] or "miss"
+                    new_email_short = result["new_email"][:50] if result["new_email"] else "-"
+                    first = (lead.get("first_name") or "").lower()
+                    last = (lead.get("last_name") or "").lower()
+                    school = lead.get("school_name", "")
+                    print(f"[{completed:3d}/{len(todo)}] {first:>10s}.{last:<12s} @ {school[:30]:30s} -> {status_tag:10s} {new_email_short}", flush=True)
 
     print()
     print(f"=== summary ===")

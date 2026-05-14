@@ -89,6 +89,26 @@ def generate_lead_id(email: str, first: str, last: str) -> str:
     return f"lead_{h[:24]}"
 
 
+FREE_EMAIL_DOMAINS = {
+    "gmail.com", "yahoo.com", "yahoo.co.uk", "hotmail.com", "outlook.com",
+    "aol.com", "icloud.com", "me.com", "live.com", "msn.com",
+    "comcast.net", "verizon.net", "att.net", "sbcglobal.net", "cox.net",
+    "bellsouth.net", "earthlink.net", "charter.net", "mac.com", "ymail.com",
+    "rocketmail.com", "protonmail.com", "proton.me", "mail.com", "gmx.com",
+}
+
+
+def derive_domain_from_email(email: str) -> str:
+    """For school/org emails, the email domain IS the org domain.
+    Returns '' for free email providers (gmail, yahoo, etc.)."""
+    if not email or "@" not in email:
+        return ""
+    dom = email.rsplit("@", 1)[-1].strip().lower()
+    if not dom or dom in FREE_EMAIL_DOMAINS:
+        return ""
+    return dom
+
+
 def main() -> None:
     wb = openpyxl.load_workbook(SRC, read_only=True, data_only=True)
     ws = wb[wb.sheetnames[0]]
@@ -157,25 +177,36 @@ def main() -> None:
             last = parts[1] if len(parts) > 1 else ""
 
         email = g(row, "email").lower()
-        if not email:
+        school = g(row, "company")
+        existing_phone = g(row, "_phone") or g(row, "_phone2") or g(row, "phone")
+        existing_linkedin = g(row, "linkedin_url")
+
+        # Keep the lead if it has either an email OR a usable contact alternative
+        # (phone or linkedin) — emailless leads with phones are still real leads.
+        has_contact = bool(email or existing_phone or existing_linkedin)
+        if not has_contact:
             drop_no_email += 1
             continue
-        school = g(row, "company")
+        if not first or not last or not school:
+            drop_no_email += 1
+            continue
+
         key = (school.lower(), first.lower(), last.lower())
         if key in seen:
             drop_dup += 1
             continue
         seen.add(key)
 
-        # Generate lead_id if source doesn't have one
-        lead_id = g(row, "id") or generate_lead_id(email, first, last)
+        # Generate lead_id if source doesn't have one.
+        # Use email when present (highest uniqueness); else fall back to name+school.
+        if email:
+            lead_id = g(row, "id") or generate_lead_id(email, first, last)
+        else:
+            lead_id = g(row, "id") or generate_lead_id(f"{first}|{last}|{school}", first, last)
 
         city_loc, state_loc = parse_location(g(row, "location"))
         state = g(row, "state") or state_loc
         city = g(row, "city") or city_loc
-
-        existing_linkedin = g(row, "linkedin_url")
-        existing_phone = g(row, "_phone") or g(row, "_phone2")
 
         cleaned.append({
             "lead_id": lead_id,
@@ -186,7 +217,7 @@ def main() -> None:
             "role": g(row, "title"),
             "role_category": g(row, "contact_type"),
             "school_name": school,
-            "school_domain": g(row, "company_domain"),
+            "school_domain": g(row, "company_domain") or derive_domain_from_email(email),
             "city": city,
             "state": state,
             "email": email,

@@ -15,7 +15,9 @@ import os
 import random
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from ddgs import DDGS
@@ -25,6 +27,7 @@ LEADS = ROOT / "data" / "leads_clean.csv"
 OUT = ROOT / "data" / "linkedin_results.csv"
 
 OUT_FIELDS = ["lead_id", "linkedin_url", "linkedin_confidence", "source_query", "snippet", "engine"]
+WORKERS = int(os.environ.get("GRIDIRON_LINKEDIN_FIND_WORKERS", "5"))
 
 LINKEDIN_RE = re.compile(r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/in/[^\s\"'<>?#]+", re.I)
 COACH_KEYWORDS = ("coach", "athletic director", "football", "head coach")
@@ -167,22 +170,42 @@ def main() -> None:
         leads = list(csv.DictReader(f))
     done = load_done(OUT)
     todo = [l for l in leads if l["lead_id"] not in done]
-    print(f"leads total: {len(leads)} | already done: {len(done)} | todo: {len(todo)}")
+    print(f"leads total: {len(leads)} | already done: {len(done)} | todo: {len(todo)} | workers: {WORKERS}")
 
     is_new_file = not OUT.exists()
+    lock = threading.Lock()
+
+    def process(lead: dict) -> dict:
+        try:
+            r = find_for_lead(lead)
+        except Exception as e:  # noqa: BLE001
+            r = {"lead_id": lead["lead_id"], "linkedin_url":"", "linkedin_confidence":"",
+                 "source_query": f"err:{e.__class__.__name__}", "snippet":"", "engine":""}
+        time.sleep(random.uniform(0.4, 0.8))
+        return r
+
     with OUT.open("a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=OUT_FIELDS)
         if is_new_file:
             w.writeheader()
-        for i, lead in enumerate(todo, 1):
-            result = find_for_lead(lead)
-            w.writerow(result)
-            f.flush()
-            conf = result["linkedin_confidence"] or "miss"
-            url_short = result["linkedin_url"].replace("https://www.linkedin.com/in/", "li:") or "-"
-            eng = result["engine"] or "-"
-            print(f"[{i:3d}/{len(todo)}] {lead['first_name']:12s} {lead['last_name']:14s} @ {lead['school_name'][:36]:36s}  {conf:12s} {eng:8s} {url_short}", flush=True)
-            time.sleep(random.uniform(1.5, 2.5))  # polite inter-lead pace
+        completed = 0
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futures = {ex.submit(process, l): l for l in todo}
+            for fut in as_completed(futures):
+                lead = futures[fut]
+                try:
+                    result = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    result = {"lead_id": lead["lead_id"], "linkedin_url":"", "linkedin_confidence":"",
+                              "source_query": f"err:{e.__class__.__name__}", "snippet":"", "engine":""}
+                with lock:
+                    completed += 1
+                    w.writerow(result)
+                    f.flush()
+                    conf = result["linkedin_confidence"] or "miss"
+                    url_short = result["linkedin_url"].replace("https://www.linkedin.com/in/", "li:") or "-"
+                    eng = result["engine"] or "-"
+                    print(f"[{completed:3d}/{len(todo)}] {lead['first_name']:12s} {lead['last_name']:14s} @ {lead['school_name'][:36]:36s}  {conf:12s} {eng:8s} {url_short}", flush=True)
 
 
 if __name__ == "__main__":

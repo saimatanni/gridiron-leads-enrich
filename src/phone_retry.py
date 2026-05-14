@@ -18,7 +18,9 @@ import os
 import random
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -26,6 +28,9 @@ import httpx
 import openpyxl
 from ddgs import DDGS
 from selectolax.parser import HTMLParser
+
+WORKERS = int(os.environ.get("GRIDIRON_PHONE_WORKERS", "5"))
+WRITE_EVERY = 10  # flush CSV after this many lead updates
 
 ROOT = Path(os.environ.get("GRIDIRON_DATASET_ROOT") or Path(__file__).resolve().parent.parent)
 LEADS = ROOT / "data" / "leads_clean.csv"
@@ -259,14 +264,33 @@ def scrub_invalid(current: dict[str, dict]) -> int:
     return scrubbed
 
 
+def _school_key(lead: dict) -> str:
+    """Group key for the school-cache. Same school+state → one lookup."""
+    return f"{(lead.get('school_name') or '').strip().lower()}|{(lead.get('state') or '').strip().lower()}"
+
+
+def write_csv(current: dict[str, dict]) -> None:
+    """Atomic-ish write of the phone_results.csv file."""
+    tmp = PHONES.with_suffix(".csv.tmp")
+    with tmp.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=OUT_FIELDS)
+        w.writeheader()
+        for r in current.values():
+            w.writerow({k: r.get(k, "") for k in OUT_FIELDS})
+    tmp.replace(PHONES)
+
+
+def lookup_school_phone(school_key: str, sample_lead: dict) -> tuple[str, str]:
+    """Single Google search for the school's main phone. Cached per school."""
+    return google_phone_for_school(sample_lead)
+
+
 def main() -> None:
     with LEADS.open() as f:
         leads_by_id = {r["lead_id"]: r for r in csv.DictReader(f)}
     with PHONES.open() as f:
         current = {r["lead_id"]: r for r in csv.DictReader(f)}
 
-    # First pass: scrub any phones with invalid US area codes (junk from
-    # earlier runs or future Google snippet false-positives)
     scrubbed = scrub_invalid(current)
     if scrubbed:
         print(f"scrubbed {scrubbed} invalid phones (area code not in NANP list)")
@@ -277,34 +301,86 @@ def main() -> None:
     print(f"  with phone     : {sum(1 for r in current.values() if r.get('phone_school') or r.get('phone_direct'))}")
     print(f"  without phone  : {len(targets)}")
 
+    # ---- School cache: group targets by (school_name, state) ----
+    school_to_lids: dict[str, list[str]] = {}
+    for lid in targets:
+        lead = leads_by_id.get(lid, {})
+        if not lead.get("school_name"):
+            continue
+        school_to_lids.setdefault(_school_key(lead), []).append(lid)
+
+    unique_schools = list(school_to_lids.keys())
+    print(f"  unique schools needing lookup: {len(unique_schools)} (saves {len(targets) - len(unique_schools)} duplicate searches)")
+
     maxpreps = load_maxpreps_urls()
     print(f"  with maxpreps url available: {sum(1 for lid in targets if maxpreps.get(lid))}")
+    print(f"  parallel workers: {WORKERS}")
     print()
 
     new_phones = 0
-    by_source = {"google": 0, "extra_paths": 0, "maxpreps": 0}
+    by_source = {"google_cached": 0, "google": 0, "extra_paths": 0, "maxpreps": 0}
+    lock = threading.Lock()
+    updates_since_flush = 0
+
+    def process_school(school_key: str) -> tuple[str, str, str]:
+        """Returns (school_key, phone, source). Phone may be ''."""
+        sample_lid = school_to_lids[school_key][0]
+        sample_lead = leads_by_id[sample_lid]
+        phone, src = lookup_school_phone(school_key, sample_lead)
+        time.sleep(random.uniform(0.3, 0.7))  # gentle on Google
+        return school_key, phone, src
+
+    # ---- Pass A (parallel) — one Google search per unique school ----
+    print(f"[Pass A] parallel Google search across {len(unique_schools)} schools…")
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futures = {ex.submit(process_school, sk): sk for sk in unique_schools}
+        done = 0
+        for fut in as_completed(futures):
+            sk = futures[fut]
+            try:
+                _sk, phone, src = fut.result()
+            except Exception as e:  # noqa: BLE001
+                phone, src = "", ""
+                print(f"  err {sk}: {e.__class__.__name__}", file=sys.stderr)
+            done += 1
+            lids = school_to_lids[sk]
+            sample_lead = leads_by_id[lids[0]]
+            tag = "FOUND" if phone else "miss "
+            print(f"  [{done:3d}/{len(unique_schools)}] {sample_lead.get('school_name','')[:35]:35s} → {tag} {phone or '-'} (applies to {len(lids)} leads)", flush=True)
+            if phone:
+                with lock:
+                    for lid in lids:
+                        cur = current[lid]
+                        cur["phone_school"] = phone
+                        cur["source_page"] = src
+                        cur["notes"] = "found via google retry (school-cached)"
+                        new_phones += 1
+                        by_source["google_cached"] += 1
+                        updates_since_flush += 1
+                    if updates_since_flush >= WRITE_EVERY:
+                        write_csv(current)
+                        updates_since_flush = 0
+
+    # Flush after Pass A
+    write_csv(current)
+    updates_since_flush = 0
+
+    # ---- Pass B — remaining leads without phone, try extra URL paths + maxpreps ----
+    remaining = [lid for lid in targets
+                 if not (current[lid].get("phone_school") or current[lid].get("phone_direct"))]
+    print()
+    print(f"[Pass B+C] sequential fallback for {len(remaining)} stragglers…")
 
     with httpx.Client(headers=HEADERS, verify=True) as client:
-        for i, lid in enumerate(targets, 1):
+        for i, lid in enumerate(remaining, 1):
             lead = leads_by_id.get(lid, {})
             if not lead:
                 continue
             cur = current[lid]
             found = False
 
-            # Pass A — Google search
-            phone, src = google_phone_for_school(lead)
-            if phone:
-                cur["phone_school"] = phone
-                cur["source_page"] = src
-                cur["notes"] = "found via google retry"
-                current[lid] = cur
-                new_phones += 1
-                by_source["google"] += 1
-                found = True
-
             # Pass B — extra URL paths
-            if not found and lead.get("school_domain"):
+            if lead.get("school_domain"):
                 sp, dp, src = extra_paths_for_domain(lead, client)
                 if dp or sp:
                     if dp:
@@ -313,7 +389,6 @@ def main() -> None:
                         cur["phone_school"] = sp
                     cur["source_page"] = src
                     cur["notes"] = "found via extra paths"
-                    current[lid] = cur
                     new_phones += 1
                     by_source["extra_paths"] += 1
                     found = True
@@ -328,23 +403,20 @@ def main() -> None:
                         cur["phone_school"] = sp
                     cur["source_page"] = src
                     cur["notes"] = "found via maxpreps retry"
-                    current[lid] = cur
                     new_phones += 1
                     by_source["maxpreps"] += 1
                     found = True
 
             status = "FOUND" if found else "miss"
             ph = cur.get("phone_direct") or cur.get("phone_school") or "-"
-            print(f"[{i:3d}/{len(targets)}] {lead.get('first_name',''):>10s} {lead.get('last_name',''):<12s} @ {lead.get('school_domain','')[:30]:30s}  {status:6s} {ph}", flush=True)
-            time.sleep(random.uniform(0.8, 1.4))
+            print(f"  [{i:3d}/{len(remaining)}] {lead.get('first_name',''):>10s} {lead.get('last_name',''):<12s} @ {lead.get('school_domain','')[:30]:30s}  {status:6s} {ph}", flush=True)
+            updates_since_flush += 1
+            if updates_since_flush >= WRITE_EVERY:
+                write_csv(current)
+                updates_since_flush = 0
+            time.sleep(random.uniform(0.3, 0.6))
 
-    # Write back
-    with PHONES.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=OUT_FIELDS)
-        w.writeheader()
-        for r in current.values():
-            w.writerow({k: r.get(k, "") for k in OUT_FIELDS})
-
+    write_csv(current)
     print()
     print("=== summary ===")
     print(f"  new phones found: {new_phones}")

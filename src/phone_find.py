@@ -14,7 +14,9 @@ import os
 import random
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -26,6 +28,8 @@ LEADS = ROOT / "data" / "leads_clean.csv"
 OUT = ROOT / "data" / "phone_results.csv"
 
 OUT_FIELDS = ["lead_id", "phone_school", "phone_direct", "source_page", "notes"]
+WORKERS = int(os.environ.get("GRIDIRON_PHONE_FIND_WORKERS", "8"))
+WRITE_EVERY = 10
 
 # Paths to try on each school domain, in priority order.
 PATHS = [
@@ -167,27 +171,117 @@ def main() -> None:
         leads = list(csv.DictReader(f))
     done = load_done(OUT)
     todo = [l for l in leads if l["lead_id"] not in done]
-    print(f"leads total: {len(leads)} | done: {len(done)} | todo: {len(todo)}")
+    print(f"leads total: {len(leads)} | done: {len(done)} | todo: {len(todo)} | workers: {WORKERS}")
+
+    # Group leads by school_domain so we hit each domain once and share results
+    domain_to_leads: dict[str, list[dict]] = {}
+    no_domain: list[dict] = []
+    for L in todo:
+        d = (L.get("school_domain") or "").strip().lower()
+        if d:
+            domain_to_leads.setdefault(d, []).append(L)
+        else:
+            no_domain.append(L)
+    print(f"  unique domains: {len(domain_to_leads)} (saves {len(todo)-len(domain_to_leads)-len(no_domain)} repeat fetches)")
+    print(f"  leads without domain: {len(no_domain)}")
 
     is_new = not OUT.exists()
-    with httpx.Client(headers=HEADERS, http2=False, verify=True) as client:
-        with OUT.open("a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=OUT_FIELDS)
-            if is_new:
-                w.writeheader()
-            for i, lead in enumerate(todo, 1):
-                result = process(lead, client)
-                w.writerow(result)
-                f.flush()
-                tag = []
-                if result["phone_direct"]:
-                    tag.append(f"D:{result['phone_direct']}")
-                if result["phone_school"]:
-                    tag.append(f"S:{result['phone_school']}")
-                if not tag:
-                    tag.append(result["notes"] or "-")
-                print(f"[{i:3d}/{len(todo)}] {lead['first_name']:12s} {lead['last_name']:14s} @ {lead['school_domain'][:30]:30s}  {' '.join(tag)}", flush=True)
-                time.sleep(random.uniform(0.8, 1.5))  # polite to schools
+    results_buffer: list[dict] = []
+    lock = threading.Lock()
+    completed_domains = 0
+
+    def write_buffer(f, w, flush=False):
+        """Flush results_buffer to disk."""
+        if not results_buffer:
+            return
+        for row in results_buffer:
+            w.writerow(row)
+        f.flush()
+        results_buffer.clear()
+
+    def process_domain(domain: str, leads_at_domain: list[dict]) -> list[dict]:
+        """Fetch the school site ONCE; then score phones per-lead (direct vs school)."""
+        out: list[dict] = []
+        # Use the first lead just for path-traversal context; phones get attributed per-lead
+        with httpx.Client(headers=HEADERS, http2=False, verify=True) as client:
+            base = f"https://{domain}"
+            visited = set()
+            html_by_url: dict[str, str] = {}
+            start = time.monotonic()
+            for path in PATHS:
+                if time.monotonic() - start > 25.0:
+                    break
+                url = urljoin(base, path)
+                if url in visited:
+                    continue
+                visited.add(url)
+                html = fetch(client, url)
+                if html:
+                    html_by_url[url] = html
+                    # Stop early once we have a couple of pages with content
+                    if len(html_by_url) >= 3:
+                        break
+        # For each lead at this domain, find their direct phone in any fetched page
+        for L in leads_at_domain:
+            school_phone, direct_phone, source_page, notes = "", "", "", ""
+            for url, html in html_by_url.items():
+                sp, dp = find_phones_in_html(html, L)
+                if dp and not direct_phone:
+                    direct_phone, source_page = dp, url
+                if sp and not school_phone:
+                    school_phone = sp
+                    if not source_page:
+                        source_page = url
+                if direct_phone:
+                    break
+            if not (school_phone or direct_phone):
+                notes = "no phone found on school site" if html_by_url else "school site unreachable"
+            out.append({
+                "lead_id": L["lead_id"],
+                "phone_school": school_phone,
+                "phone_direct": direct_phone,
+                "source_page": source_page,
+                "notes": notes,
+            })
+        return out
+
+    with OUT.open("a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=OUT_FIELDS)
+        if is_new:
+            w.writeheader()
+
+        # ---- Parallel domain fetches ----
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futures = {ex.submit(process_domain, d, ls): d for d, ls in domain_to_leads.items()}
+            for fut in as_completed(futures):
+                d = futures[fut]
+                try:
+                    rows = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    rows = [{"lead_id": L["lead_id"], "phone_school":"", "phone_direct":"",
+                             "source_page":"", "notes": f"err:{e.__class__.__name__}"} for L in domain_to_leads[d]]
+                with lock:
+                    completed_domains += 1
+                    for r in rows:
+                        results_buffer.append(r)
+                        L = next((x for x in domain_to_leads[d] if x["lead_id"] == r["lead_id"]), {})
+                        tag = []
+                        if r["phone_direct"]: tag.append(f"D:{r['phone_direct']}")
+                        if r["phone_school"]: tag.append(f"S:{r['phone_school']}")
+                        if not tag: tag.append(r["notes"] or "-")
+                        print(f"[{completed_domains:3d}/{len(domain_to_leads)}] {L.get('first_name',''):12s} {L.get('last_name',''):14s} @ {d[:30]:30s}  {' '.join(tag)}", flush=True)
+                    if len(results_buffer) >= WRITE_EVERY:
+                        write_buffer(f, w)
+
+        # ---- Write any remaining buffered rows + the no-domain rows ----
+        with lock:
+            write_buffer(f, w)
+        for L in no_domain:
+            w.writerow({
+                "lead_id": L["lead_id"], "phone_school":"", "phone_direct":"",
+                "source_page":"", "notes":"no domain",
+            })
+        f.flush()
 
 
 if __name__ == "__main__":

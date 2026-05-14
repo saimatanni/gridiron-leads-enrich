@@ -25,7 +25,9 @@ import os
 import random
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from ddgs import DDGS
@@ -33,6 +35,10 @@ from ddgs import DDGS
 ROOT = Path(os.environ.get("GRIDIRON_DATASET_ROOT") or Path(__file__).resolve().parent.parent)
 LEADS = ROOT / "data" / "leads_clean.csv"
 LI = ROOT / "data" / "linkedin_results.csv"
+
+WORKERS = int(os.environ.get("GRIDIRON_LINKEDIN_WORKERS", "5"))
+WRITE_EVERY = 10
+OUT_FIELDS = ["lead_id", "linkedin_url", "linkedin_confidence", "source_query", "snippet", "engine"]
 
 LINKEDIN_RE = re.compile(r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/in/[^\s\"'<>?#]+", re.I)
 ENGINES = ("google", "bing", "yahoo")
@@ -171,6 +177,16 @@ def load_email_status() -> dict[str, str]:
         return {r["lead_id"]: r["email_status"] for r in csv.DictReader(f)}
 
 
+def write_csv(current: dict[str, dict]) -> None:
+    tmp = LI.with_suffix(".csv.tmp")
+    with tmp.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=OUT_FIELDS)
+        w.writeheader()
+        for r in current.values():
+            w.writerow({k: r.get(k, "") for k in OUT_FIELDS})
+    tmp.replace(LI)
+
+
 def main() -> None:
     with LEADS.open() as f:
         leads_by_id = {r["lead_id"]: r for r in csv.DictReader(f)}
@@ -178,72 +194,89 @@ def main() -> None:
         current = {r["lead_id"]: r for r in csv.DictReader(f)}
     email_status = load_email_status()
 
-    # Targets: empty URL OR needs_review status
     targets = [lid for lid, r in current.items()
                if not r["linkedin_url"] or r["linkedin_confidence"] == "needs_review"]
 
-    # Skip leads whose current entry is already 'high' — leave them alone
     print(f"current LinkedIn rows: {len(current)}")
     print(f"  high       : {sum(1 for r in current.values() if r['linkedin_confidence'] == 'high')}")
     print(f"  medium     : {sum(1 for r in current.values() if r['linkedin_confidence'] == 'medium')}")
     print(f"  needs_review: {sum(1 for r in current.values() if r['linkedin_confidence'] == 'needs_review')}")
     print(f"  empty      : {sum(1 for r in current.values() if not r['linkedin_url'])}")
-    print(f"retrying {len(targets)} leads")
+    print(f"retrying {len(targets)} leads with {WORKERS} parallel workers")
     print()
 
+    rank = {"high": 3, "medium": 2, "needs_review": 1, "": 0}
     promoted_by_slug = 0
     new_high = 0
     new_medium = 0
     new_nr = 0
-    upgraded = 0  # needs_review -> medium/high
+    upgraded = 0
+    lock = threading.Lock()
+    updates_since_flush = 0
 
-    rank = {"high": 3, "medium": 2, "needs_review": 1, "": 0}
-
-    for i, lid in enumerate(targets, 1):
+    # ---- Auto-promote pass (no network, fast) ----
+    search_targets = []
+    for lid in targets:
         lead = leads_by_id.get(lid, {})
         if not lead:
             continue
         cur = current[lid]
-        cur_conf = cur["linkedin_confidence"]
         cur_url = cur["linkedin_url"]
-
-        # Auto-promote pass: if current URL slug has both first+last name AND
-        # currently labeled needs_review, bump to medium (without doing search)
-        if cur_url and cur_conf == "needs_review" and slug_matches_both(
+        if cur_url and cur["linkedin_confidence"] == "needs_review" and slug_matches_both(
                 cur_url, lead.get("first_name", ""), lead.get("last_name", "")):
             cur["linkedin_confidence"] = "medium"
             cur["source_query"] = cur["source_query"] + " [promoted: slug=first+last]"
             promoted_by_slug += 1
             upgraded += 1
-            current[lid] = cur
-            print(f"[{i:3d}/{len(targets)}] {lead.get('first_name',''):>10s} {lead.get('last_name',''):<12s}  ✨ promoted needs_review -> medium (slug={cur_url.rsplit('/',1)[-1][:30]})", flush=True)
             continue
+        search_targets.append(lid)
 
-        # Search pass: try new query strategies
+    if promoted_by_slug:
+        print(f"auto-promoted {promoted_by_slug} via slug match (no search needed)")
+        write_csv(current)
+    print(f"running parallel search on {len(search_targets)} remaining leads")
+    print()
+
+    def process_lead(lid: str) -> tuple[str, dict | None, str]:
+        lead = leads_by_id.get(lid, {})
+        if not lead:
+            return lid, None, ""
         em_status = email_status.get(lid, "")
         result = attempt_for_lead(lead, em_status)
-        if result and rank[result["linkedin_confidence"]] > rank[cur_conf]:
-            current[lid] = result
-            if result["linkedin_confidence"] == "high": new_high += 1
-            elif result["linkedin_confidence"] == "medium": new_medium += 1
-            else: new_nr += 1
-            if cur_conf == "needs_review" and result["linkedin_confidence"] in ("high", "medium"):
-                upgraded += 1
-            url_short = result["linkedin_url"].replace("https://www.linkedin.com/in/", "li:")
-            tag = result["source_query"].split("]")[0].lstrip("[") if "]" in result["source_query"] else ""
-            print(f"[{i:3d}/{len(targets)}] {lead.get('first_name',''):>10s} {lead.get('last_name',''):<12s}  {result['linkedin_confidence']:12s} via {tag:14s} {url_short}", flush=True)
-        else:
-            print(f"[{i:3d}/{len(targets)}] {lead.get('first_name',''):>10s} {lead.get('last_name',''):<12s}  no improvement", flush=True)
-        time.sleep(random.uniform(1.0, 1.8))
+        time.sleep(random.uniform(0.3, 0.6))
+        return lid, result, current[lid]["linkedin_confidence"]
 
-    # Write back
-    OUT_FIELDS = ["lead_id", "linkedin_url", "linkedin_confidence", "source_query", "snippet", "engine"]
-    with LI.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=OUT_FIELDS)
-        w.writeheader()
-        for r in current.values():
-            w.writerow({k: r.get(k, "") for k in OUT_FIELDS})
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futures = {ex.submit(process_lead, lid): lid for lid in search_targets}
+        done = 0
+        for fut in as_completed(futures):
+            lid = futures[fut]
+            try:
+                _lid, result, prev_conf = fut.result()
+            except Exception as e:  # noqa: BLE001
+                result, prev_conf = None, current[lid]["linkedin_confidence"]
+                print(f"  err {lid}: {e.__class__.__name__}", file=sys.stderr)
+            done += 1
+            lead = leads_by_id.get(lid, {})
+            with lock:
+                if result and rank[result["linkedin_confidence"]] > rank[prev_conf]:
+                    current[lid] = result
+                    if result["linkedin_confidence"] == "high": new_high += 1
+                    elif result["linkedin_confidence"] == "medium": new_medium += 1
+                    else: new_nr += 1
+                    if prev_conf == "needs_review" and result["linkedin_confidence"] in ("high", "medium"):
+                        upgraded += 1
+                    url_short = result["linkedin_url"].replace("https://www.linkedin.com/in/", "li:")
+                    tag = result["source_query"].split("]")[0].lstrip("[") if "]" in result["source_query"] else ""
+                    print(f"[{done:3d}/{len(search_targets)}] {lead.get('first_name',''):>10s} {lead.get('last_name',''):<12s}  {result['linkedin_confidence']:12s} via {tag:14s} {url_short}", flush=True)
+                else:
+                    print(f"[{done:3d}/{len(search_targets)}] {lead.get('first_name',''):>10s} {lead.get('last_name',''):<12s}  no improvement", flush=True)
+                updates_since_flush += 1
+                if updates_since_flush >= WRITE_EVERY:
+                    write_csv(current)
+                    updates_since_flush = 0
 
+    write_csv(current)
     print()
     print("=== summary ===")
     print(f"  auto-promoted (slug=first+last): {promoted_by_slug}")
