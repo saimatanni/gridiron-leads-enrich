@@ -125,6 +125,14 @@ def smtp_probe(email: str) -> tuple[str, str, str]:
 
 
 def search(query: str) -> list[dict]:
+    if os.environ.get("BRAVE_API_KEY"):
+        try:
+            from brave_search import brave_search
+            results = brave_search(query, count=10)
+            if results:
+                return results
+        except Exception:  # noqa: BLE001
+            pass
     for engine in ENGINES:
         try:
             with DDGS() as ddg:
@@ -225,7 +233,13 @@ def candidate_domains(results: list[dict], school_name: str, city: str = "") -> 
 
 
 def load_dead_leads() -> list[dict]:
-    """Return lead dicts for emails that currently have no MX (dead domain)."""
+    """Return lead dicts that need email recovery.
+
+    Default: only emails with 'no MX' (dead domain).
+    Wide-net mode (GRIDIRON_DOMAIN_RECOVERY_WIDE=1): every lead without a
+    valid/catch_all email — including emailless leads and SMTP-rejected ones.
+    """
+    wide = os.environ.get("GRIDIRON_DOMAIN_RECOVERY_WIDE") == "1"
     with EMAIL_VERIFY.open() as f:
         verify = {r["lead_id"]: r for r in csv.DictReader(f)}
     with LEADS.open() as f:
@@ -234,9 +248,18 @@ def load_dead_leads() -> list[dict]:
     for lead in leads:
         v = verify.get(lead["lead_id"])
         if not v:
+            # No verify record at all = emailless or new. In wide mode, include it.
+            if wide and lead.get("first_name") and lead.get("last_name") and lead.get("school_name"):
+                dead.append(lead)
             continue
-        if v["email_status"] == "invalid" and "no MX" in (v.get("smtp_message") or ""):
-            dead.append(lead)
+        status = v.get("email_status", "")
+        if wide:
+            if status not in ("valid", "catch_all"):
+                if lead.get("first_name") and lead.get("last_name") and lead.get("school_name"):
+                    dead.append(lead)
+        else:
+            if status == "invalid" and "no MX" in (v.get("smtp_message") or ""):
+                dead.append(lead)
     return dead
 
 
@@ -245,6 +268,26 @@ def load_done() -> set[str]:
         return set()
     with OUT.open() as f:
         return {r["lead_id"] for r in csv.DictReader(f)}
+
+
+# School-level cache: (school, state) -> [(domain, source_url), ...]
+# Many leads share schools — caching the Google "school domain" search drops
+# Brave query count by ~3x for typical datasets.
+_SCHOOL_DOMAIN_CACHE: dict[tuple[str, str], list[tuple[str, str]]] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _candidate_domains_for_school(school: str, state: str, city: str = "") -> list[tuple[str, str]]:
+    key = (school.lower().strip(), state.lower().strip())
+    with _CACHE_LOCK:
+        if key in _SCHOOL_DOMAIN_CACHE:
+            return _SCHOOL_DOMAIN_CACHE[key]
+    q = f'"{school}" "{state}"' if state else f'"{school}"'
+    results = search(q)
+    cands = candidate_domains(results, school, city=city)
+    with _CACHE_LOCK:
+        _SCHOOL_DOMAIN_CACHE[key] = cands
+    return cands
 
 
 def recover_one(lead: dict) -> dict:
@@ -268,9 +311,7 @@ def recover_one(lead: dict) -> dict:
         "source_url": "",
     }
 
-    q = f'"{school}" "{state}"' if state else f'"{school}"'
-    results = search(q)
-    cands = candidate_domains(results, school, city=lead.get("city", ""))
+    cands = _candidate_domains_for_school(school, state, city=lead.get("city", ""))
 
     tested = []
     found = False

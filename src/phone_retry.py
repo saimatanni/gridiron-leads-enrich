@@ -131,6 +131,13 @@ def fetch(client: httpx.Client, url: str) -> str | None:
 
 
 def search(query: str) -> tuple[list[dict], str]:
+    if os.environ.get("BRAVE_API_KEY"):
+        try:
+            from brave_search import brave_search
+            return brave_search(query, count=10), "brave"
+        except Exception as e:  # noqa: BLE001
+            print(f"    brave err: {e.__class__.__name__}", file=sys.stderr)
+            return [], ""
     for engine in ENGINES:
         try:
             with DDGS() as ddg:

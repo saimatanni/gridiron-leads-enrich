@@ -181,12 +181,9 @@ def main() -> None:
         existing_phone = g(row, "_phone") or g(row, "_phone2") or g(row, "phone")
         existing_linkedin = g(row, "linkedin_url")
 
-        # Keep the lead if it has either an email OR a usable contact alternative
-        # (phone or linkedin) — emailless leads with phones are still real leads.
-        has_contact = bool(email or existing_phone or existing_linkedin)
-        if not has_contact:
-            drop_no_email += 1
-            continue
+        # Keep ANY real lead — even if no contact info is in the source row.
+        # The enrichment phases (phone_find, linkedin_find, domain_recovery)
+        # will try to discover contacts. We only need name + school to start.
         if not first or not last or not school:
             drop_no_email += 1
             continue

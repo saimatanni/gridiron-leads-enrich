@@ -1,7 +1,7 @@
 """School-batched LinkedIn discovery.
 
 Instead of one Google search per lead (slow), do ONE search per unique
-school: `site:linkedin.com/in "School Name" coach`. That single query returns
+school: `site:linkedin.com "School Name" coach`. That single query returns
 5-10 LinkedIn profiles of staff at that school. Match each result by slug
 against the leads we have at that school.
 
@@ -57,6 +57,14 @@ def slug_matches(slug: str, first: str, last: str) -> tuple[bool, bool]:
 
 
 def search(query: str) -> tuple[list[dict], str]:
+    if os.environ.get("BRAVE_API_KEY"):
+        try:
+            from brave_search import brave_search
+            results = brave_search(query, count=15)
+            if results:
+                return results, "brave"
+        except Exception as e:  # noqa: BLE001
+            print(f"  brave err: {e.__class__.__name__}", file=sys.stderr)
     for engine in ENGINES:
         try:
             with DDGS() as ddg:
@@ -90,14 +98,14 @@ def search_school(school: str, state: str = "") -> tuple[list[tuple[str, str]], 
     """One Google search for the school's coaches on LinkedIn.
     Returns (hits, engine_used, query_used)."""
     if state:
-        q = f'site:linkedin.com/in "{school}" "{state}" coach'
+        q = f'site:linkedin.com "{school}" "{state}" coach'
     else:
-        q = f'site:linkedin.com/in "{school}" coach'
+        q = f'site:linkedin.com "{school}" coach'
     results, engine = search(q)
     hits = collect_linkedin_hits(results)
     # Fallback: drop the "coach" keyword
     if not hits:
-        q2 = f'site:linkedin.com/in "{school}"'
+        q2 = f'site:linkedin.com "{school}"'
         results, engine = search(q2)
         hits = collect_linkedin_hits(results)
         if hits:

@@ -115,11 +115,17 @@ def first_linkedin_hit(results: list[dict], first: str, last: str) -> tuple[str,
 
 
 def search(query: str) -> tuple[list[dict], str]:
-    """Rotate through Google → Bing → Yahoo. Returns (results, engine_used).
-
-    Some engines fail open ("No results found"), some throw on rate-limit.
-    We treat both as "try the next engine".
-    """
+    """Returns (results, engine_used). Brave-only when configured (no DDGS fallback).
+    The DDGS fallback wastes 10-30s per miss when Brave returns empty, so for
+    bulk runs we accept Brave-empty as final."""
+    if os.environ.get("BRAVE_API_KEY"):
+        try:
+            from brave_search import brave_search
+            results = brave_search(query, count=10)
+            return results, "brave"
+        except Exception as e:  # noqa: BLE001
+            print(f"  brave err: {e.__class__.__name__}: {str(e)[:80]}", file=sys.stderr)
+            return [], ""
     for engine in ENGINES:
         try:
             with DDGS() as ddg:
@@ -140,14 +146,14 @@ def find_for_lead(lead: dict) -> dict:
 
     # Single primary query — fallback queries return too many wrong-person hits
     # via SERP-aggregation to be worth the 3x time cost.
-    q = f'"{first} {last}" "{school}" site:linkedin.com/in'
+    q = f'"{first} {last}" "{school}" site:linkedin.com'
     results, engine = search(q)
     url, snippet = first_linkedin_hit(results, first, last)
     conf = classify(url, snippet, lead)
 
     # If the primary missed entirely AND we have a domain, one cheap fallback
     if not url and domain:
-        q2 = f'"{first} {last}" "{domain}" site:linkedin.com/in'
+        q2 = f'"{first} {last}" "{domain}" site:linkedin.com'
         time.sleep(0.5)
         results, engine = search(q2)
         url, snippet = first_linkedin_hit(results, first, last)

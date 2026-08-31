@@ -5,8 +5,8 @@ Targets two groups:
   • leads with linkedin_confidence == 'needs_review' -> try fresh queries
 
 Three new query strategies (in order):
-  1. "FirstName LastName" "football coach" "STATE" site:linkedin.com/in
-  2. email-as-key   →  "name@domain" site:linkedin.com/in
+  1. "FirstName LastName" "football coach" "STATE" site:linkedin.com
+  2. email-as-key   →  "name@domain" site:linkedin.com
   3. email-on-web   →  "name@domain"          (no site filter) — finds the
                                                 school staff page that
                                                 often LINKS to LinkedIn
@@ -92,6 +92,14 @@ def classify(url: str, snippet: str, lead: dict) -> str:
 
 
 def search(query: str) -> tuple[list[dict], str]:
+    # Brave-only when configured — no DDGS fallback (it wastes time on rate-limited misses).
+    if os.environ.get("BRAVE_API_KEY"):
+        try:
+            from brave_search import brave_search
+            return brave_search(query, count=10), "brave"
+        except Exception as e:  # noqa: BLE001
+            print(f"    brave err: {e.__class__.__name__}", file=sys.stderr)
+            return [], ""
     for engine in ENGINES:
         try:
             with DDGS() as ddg:
@@ -134,11 +142,11 @@ def attempt_for_lead(lead: dict, email_status: str) -> dict | None:
     queries: list[tuple[str, str]] = []
     if state:
         queries.append(("role_state",
-                        f'"{first} {last}" "football coach" "{state}" site:linkedin.com/in'))
+                        f'"{first} {last}" "football coach" "{state}" site:linkedin.com'))
         queries.append(("role_state_alt",
-                        f'"{first} {last}" "athletic director" "{state}" site:linkedin.com/in'))
+                        f'"{first} {last}" "athletic director" "{state}" site:linkedin.com'))
     if email and email_status in ("valid", "catch_all"):
-        queries.append(("email_li", f'"{email}" site:linkedin.com/in'))
+        queries.append(("email_li", f'"{email}" site:linkedin.com'))
         # email-on-web: find the staff page; its body often contains the LinkedIn URL
         queries.append(("email_web", f'"{email}"'))
 
@@ -188,6 +196,12 @@ def write_csv(current: dict[str, dict]) -> None:
 
 
 def main() -> None:
+    # Skip if marker file exists or env var set — user chose not to retry
+    skip_marker = ROOT / "SKIP_LINKEDIN_RETRY"
+    if skip_marker.exists() or os.environ.get("GRIDIRON_SKIP_LINKEDIN_RETRY") == "1":
+        print("skipping linkedin_retry (SKIP_LINKEDIN_RETRY marker or env var set)")
+        return
+
     with LEADS.open() as f:
         leads_by_id = {r["lead_id"]: r for r in csv.DictReader(f)}
     with LI.open() as f:
